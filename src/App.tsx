@@ -45,7 +45,7 @@ import {
   Undo,
   WarningAmber
 } from '@mui/icons-material'
-import { diffScript, useContinuityStore } from './store'
+import { createEmptyReview, diffScript, useContinuityStore } from './store'
 import type { RevisionColor, Scene, WarningItem, WarningStatus } from './types'
 
 const revisionOptions: Array<{ value: RevisionColor; label: string; color: string }> = [
@@ -62,6 +62,8 @@ const revisionOptions: Array<{ value: RevisionColor; label: string; color: strin
 const dayNightOptions = ['白天', '夜', '清晨', '黄昏', '傍晚']
 const timePeriods = ['白天', '夜', '清晨', '黄昏', '傍晚']
 const searchFields = ['slug', 'synopsis', 'location', 'storyTime', 'reason'] as const
+const statusLabel = (status: WarningStatus) => status === 'accepted' ? '已接受' : status === 'ignored' ? '已忽略' : '未做决定'
+const formatTime = (value: string | null) => value ? new Date(value).toLocaleString('zh-CN') : '升级前（时间未知）'
 
 function Highlight({ text, query }: { text: string; query: string }) {
   if (!query.trim()) return <>{text}</>
@@ -343,7 +345,7 @@ export default function App() {
         </Stack>
         <Stack gap={1.5}>
           {visibleWarnings.map((warning) => {
-            const review = state.reviews[warning.id] ?? { status: 'pending' as WarningStatus, replies: [] }
+            const review = state.reviews[warning.id] ?? createEmptyReview()
             const scene = state.script.scenes.find((item) => item.id === warning.sceneId)
             return (
               <Paper
@@ -364,8 +366,45 @@ export default function App() {
                     <Typography mt={1}>{warning.detail}</Typography>
                     <Typography variant="body2" color="text.secondary" mt={.5}>建议：{warning.suggestion}</Typography>
                   </Box>
-                  <Chip label={review.status === 'accepted' ? '已接受' : review.status === 'ignored' ? '已忽略' : '待审'} color={review.status === 'accepted' ? 'success' : review.status === 'ignored' ? 'default' : 'warning'} />
+                  <Box textAlign="right">
+                    <Chip label={review.status === 'accepted' ? '已接受' : review.status === 'ignored' ? '已忽略' : '待审'} color={review.status === 'accepted' ? 'success' : review.status === 'ignored' ? 'default' : 'warning'} />
+                    {review.status !== 'pending' && (
+                      <Typography variant="caption" color="text.secondary" display="block" mt={0.5}>决定于 {formatTime(review.decidedAt)}</Typography>
+                    )}
+                  </Box>
                 </Box>
+                {review.status !== 'pending' && (
+                  <Typography variant="caption" color="text.secondary" display="block" mt={1}>
+                    此决定只绑定当前内容（场景 {warning.sceneNumber}{warning.entities.length ? ` · ${warning.entities.join('、')}` : ''}）；场景号、涉及对象或说明文字一变，或警告消失后重现，即自动回到待审。
+                  </Typography>
+                )}
+                {review.history.length > 0 && (
+                  <Box className="review-history">
+                    <Typography className="section-label">已失效的决定</Typography>
+                    {review.history.map((entry, index) => (
+                      <Box key={`${entry.invalidatedAt}-${index}`} className="review-history-item">
+                        <Typography variant="body2">上次决定：{statusLabel(entry.status)} · 决定于 {formatTime(entry.decidedAt)}</Typography>
+                        <Typography variant="body2" color="text.secondary">{formatTime(entry.invalidatedAt)} 起不再算数：{entry.reason}</Typography>
+                        {entry.snapshot && (
+                          <Typography variant="caption" color="text.secondary" display="block">
+                            当时内容：场景 {entry.snapshot.sceneNumber}{entry.snapshot.entities.length ? ` · ${entry.snapshot.entities.join('、')}` : ''} · {entry.snapshot.title}
+                          </Typography>
+                        )}
+                        {entry.replies.length > 0 && (
+                          <Box className="review-history-replies">
+                            {entry.replies.map((reply) => (
+                              <Box key={reply.id} className="reply-item">
+                                <strong>{reply.author}</strong>
+                                <span>{reply.text}</span>
+                                <small>{new Date(reply.createdAt).toLocaleString('zh-CN')}</small>
+                              </Box>
+                            ))}
+                          </Box>
+                        )}
+                      </Box>
+                    ))}
+                  </Box>
+                )}
                 <Stack direction="row" gap={1} mt={1.5} flexWrap="wrap">
                   <Button size="small" variant={review.status === 'accepted' ? 'contained' : 'outlined'} startIcon={<CheckCircle />} onClick={() => store.setReviewStatus(warning.id, 'accepted')}>接受问题</Button>
                   <Button size="small" variant={review.status === 'ignored' ? 'contained' : 'outlined'} color="inherit" startIcon={<Block />} onClick={() => store.setReviewStatus(warning.id, 'ignored')}>忽略警告</Button>

@@ -70,6 +70,10 @@ mark { padding: 0 .1em; color: #3a2414; background: #f1d486; border-radius: 2px;
 .reply-item { display: grid; grid-template-columns: 72px 1fr auto; gap: 10px; align-items: baseline; font-size: 13px; }
 .reply-item strong { color: #765033; }
 .reply-item small { color: #958b80; }
+.review-history { display: grid; gap: 8px; margin-top: 14px; padding: 12px; border: 1px dashed #cdbfaa; border-radius: 9px; background: #faf6ec; }
+.review-history .section-label { margin-bottom: 0 !important; }
+.review-history-item { display: grid; gap: 3px; padding: 9px 11px; border: 1px solid #e4dac8; border-radius: 8px; background: #fbf8f1; }
+.review-history-replies { display: grid; gap: 5px; margin-top: 6px; padding-top: 7px; border-top: 1px dashed #e0d5c2; }
 .version-layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 16px; }
 .version-list, .diff-panel { padding: 18px; border: 1px solid #d8d0c4 !important; border-radius: 13px !important; }
 .version-list .MuiListItemButton-root { margin-top: 4px; border-radius: 8px; }

@@ -59,9 +59,12 @@ export interface WarningItem {
   type: WarningType
   severity: 'error' | 'warning'
   sceneId: string
+  sceneNumber: string
+  entities: string[]
   title: string
   detail: string
   suggestion: string
+  fingerprint: string
 }
 
 export interface Reply {
@@ -71,9 +74,31 @@ export interface Reply {
   createdAt: string
 }
 
+export interface WarningContentSnapshot {
+  sceneNumber: string
+  entities: string[]
+  title: string
+  detail: string
+  suggestion: string
+}
+
+export interface ReviewHistoryEntry {
+  status: WarningStatus
+  decidedAt: string | null
+  invalidatedAt: string
+  reason: string
+  snapshot: WarningContentSnapshot | null
+  replies: Reply[]
+}
+
 export interface WarningReview {
   status: WarningStatus
   replies: Reply[]
+  fingerprint: string | null
+  snapshot: WarningContentSnapshot | null
+  decidedAt: string | null
+  missingSince: string | null
+  history: ReviewHistoryEntry[]
 }
 
 export interface Version {

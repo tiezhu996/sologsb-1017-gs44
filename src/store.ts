@@ -1,17 +1,137 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sampleScript } from './sample'
-import type { Character, ContinuityState, DiffItem, Prop, Reply, Scene, Script, Version, Wardrobe, WarningItem, WarningReview } from './types'
+import type { Character, ContinuityState, DiffItem, Prop, Reply, Scene, Script, Version, Wardrobe, WarningContentSnapshot, WarningItem, WarningReview, WarningStatus } from './types'
 
 const STORAGE_KEY = 'sologsb-1017-continuity-v1'
 const clone = <T,>(value: T): T => structuredClone(value)
 const id = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+
+// 决定与回复只认这一条内容：场景号、涉及的角色/道具、说明文字共同构成指纹。
+function fingerprintOf(type: WarningItem['type'], sceneNumber: string, entities: string[], title: string, detail: string, suggestion: string): string {
+  return JSON.stringify([type, sceneNumber, entities, title, detail, suggestion])
+}
+
+export function snapshotOf(warning: WarningItem): WarningContentSnapshot {
+  return { sceneNumber: warning.sceneNumber, entities: [...warning.entities], title: warning.title, detail: warning.detail, suggestion: warning.suggestion }
+}
+
+export function createEmptyReview(): WarningReview {
+  return { status: 'pending', replies: [], fingerprint: null, snapshot: null, decidedAt: null, missingSince: null, history: [] }
+}
+
+function normalizeReview(raw: unknown): WarningReview {
+  const review = (raw ?? {}) as Partial<WarningReview>
+  return {
+    status: review.status === 'accepted' || review.status === 'ignored' ? review.status : 'pending',
+    replies: Array.isArray(review.replies) ? review.replies : [],
+    fingerprint: typeof review.fingerprint === 'string' ? review.fingerprint : null,
+    snapshot: review.snapshot ?? null,
+    decidedAt: typeof review.decidedAt === 'string' ? review.decidedAt : null,
+    missingSince: typeof review.missingSince === 'string' ? review.missingSince : null,
+    history: Array.isArray(review.history) ? review.history : []
+  }
+}
+
+function contentChangeReason(previous: WarningContentSnapshot | null, warning: WarningItem): string {
+  if (!previous) return '警告内容已变化'
+  const parts: string[] = []
+  if (previous.sceneNumber !== warning.sceneNumber) parts.push(`场景号由「${previous.sceneNumber}」变为「${warning.sceneNumber}」`)
+  const before = previous.entities.join('、')
+  const after = warning.entities.join('、')
+  if (before !== after) parts.push(`涉及对象由「${before || '无'}」变为「${after || '无'}」`)
+  const textChanges: string[] = []
+  if (previous.title !== warning.title) textChanges.push('标题')
+  if (previous.detail !== warning.detail) textChanges.push('详情')
+  if (previous.suggestion !== warning.suggestion) textChanges.push('建议')
+  if (textChanges.length) parts.push(`说明文字（${textChanges.join('、')}）已变化`)
+  return parts.length ? parts.join('；') : '警告内容已变化'
+}
+
+// 内容对不上或警告消失后重现：当前决定与回复归档进历史，状态回到待审。
+function invalidateReview(review: WarningReview, warning: WarningItem, invalidatedAt: string, reason: string): WarningReview {
+  const history = [...review.history]
+  if (review.status !== 'pending' || review.replies.length > 0) {
+    history.push({ status: review.status, decidedAt: review.decidedAt, invalidatedAt, reason, snapshot: review.snapshot, replies: review.replies })
+  }
+  return { status: 'pending', replies: [], fingerprint: warning.fingerprint, snapshot: snapshotOf(warning), decidedAt: null, missingSince: null, history }
+}
+
+// 每次剧本变动（编辑、撤销重做、恢复版本）后，把所有决定与当前警告重新对账。
+export function reconcileReviews(reviews: Record<string, WarningReview>, warnings: WarningItem[], now: string): Record<string, WarningReview> {
+  const byId = new Map(warnings.map((warning) => [warning.id, warning]))
+  let changed = false
+  const next: Record<string, WarningReview> = {}
+  Object.entries(reviews).forEach(([warningId, raw]) => {
+    const review = normalizeReview(raw)
+    const warning = byId.get(warningId)
+    if (!warning) {
+      // 警告暂时消失：记下消失时间，等它重现时再判失效；空记录直接清理。
+      if (review.status === 'pending' && !review.replies.length && !review.history.length) { changed = true; return }
+      next[warningId] = review.missingSince ? review : { ...review, missingSince: now }
+      if (!review.missingSince) changed = true
+      return
+    }
+    if (review.missingSince) {
+      const reason = `警告曾于 ${new Date(review.missingSince).toLocaleString('zh-CN')} 消失，重新出现后需重新审阅`
+      next[warningId] = invalidateReview(review, warning, now, reason)
+      changed = true
+      return
+    }
+    if (review.fingerprint == null) {
+      // 升级前留下的决定：按当前内容认领。
+      next[warningId] = { ...review, fingerprint: warning.fingerprint, snapshot: snapshotOf(warning) }
+      changed = true
+      return
+    }
+    if (review.fingerprint !== warning.fingerprint) {
+      next[warningId] = invalidateReview(review, warning, now, contentChangeReason(review.snapshot, warning))
+      changed = true
+      return
+    }
+    next[warningId] = review
+  })
+  return changed ? next : reviews
+}
+
+// 旧版本地数据只有 { status, replies }：能对应到当前警告的按当时内容认领，认不出来的回待审。
+function migrateState(parsed: ContinuityState): ContinuityState {
+  const now = new Date().toISOString()
+  const warnings = deriveWarnings(parsed.script)
+  const byId = new Map(warnings.map((warning) => [warning.id, warning]))
+  const legacyStamp = typeof parsed.updatedAt === 'string' ? parsed.updatedAt : now
+  const reviews: Record<string, WarningReview> = {}
+  Object.entries(parsed.reviews ?? {}).forEach(([warningId, raw]) => {
+    if (raw && typeof raw === 'object' && 'fingerprint' in raw) {
+      reviews[warningId] = normalizeReview(raw)
+      return
+    }
+    const legacy = (raw ?? {}) as { status?: WarningStatus; replies?: Reply[] }
+    const status: WarningStatus = legacy.status === 'accepted' || legacy.status === 'ignored' ? legacy.status : 'pending'
+    const replies = Array.isArray(legacy.replies) ? legacy.replies : []
+    if (status === 'pending' && !replies.length) return
+    const warning = byId.get(warningId)
+    if (warning) {
+      reviews[warningId] = { status, replies, fingerprint: warning.fingerprint, snapshot: snapshotOf(warning), decidedAt: status === 'pending' ? null : legacyStamp, missingSince: null, history: [] }
+    } else {
+      reviews[warningId] = {
+        ...createEmptyReview(),
+        missingSince: now,
+        history: [{ status, decidedAt: status === 'pending' ? null : legacyStamp, invalidatedAt: now, reason: '升级前留下的决定无法与当前警告内容对账，已回到待审', snapshot: null, replies }]
+      }
+    }
+  })
+  return { script: parsed.script, versions: Array.isArray(parsed.versions) ? parsed.versions : [], reviews, updatedAt: legacyStamp }
+}
 
 function initialState(): ContinuityState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (raw) {
       const parsed = JSON.parse(raw) as ContinuityState
-      if (parsed.script?.scenes?.length) return parsed
+      if (parsed.script?.scenes?.length) {
+        const migrated = migrateState(parsed)
+        return { ...migrated, reviews: reconcileReviews(migrated.reviews, deriveWarnings(migrated.script), new Date().toISOString()) }
+      }
     }
   } catch {
     // Ignore an invalid local draft and restore the bundled example.
@@ -24,6 +144,9 @@ export function deriveWarnings(script: Script): WarningItem[] {
   const sceneIndex = (sceneId: string) => script.scenes.findIndex((scene) => scene.id === sceneId)
   const charactersSeen = new Set<string>()
   const propsSeen = new Set<string>()
+  const stamp = (warning: Pick<WarningItem, 'id' | 'type' | 'severity' | 'sceneId' | 'title' | 'detail' | 'suggestion'>, scene: Scene, entities: string[]) => {
+    warnings.push({ ...warning, sceneNumber: scene.number, entities, fingerprint: fingerprintOf(warning.type, scene.number, entities, warning.title, warning.detail, warning.suggestion) })
+  }
 
   script.scenes.forEach((scene, index) => {
     scene.characterIds.forEach((characterId) => {
@@ -31,7 +154,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
       if (!character) return
       const introducedAt = sceneIndex(character.introducedSceneId)
       if (index > 0 && !charactersSeen.has(characterId) && introducedAt >= index) {
-        warnings.push({
+        stamp({
           id: `character-${scene.id}-${characterId}`,
           type: 'character',
           severity: index > 1 ? 'error' : 'warning',
@@ -39,7 +162,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
           title: `${character.name}突然出现`,
           detail: `角色在场景 ${scene.number} 首次出现，但前序场景没有建立其身份、关系或到场铺垫。`,
           suggestion: `在更早场景补充提及、声音或到场动作，并把“首次建立”场景改为相应场次。`
-        })
+        }, scene, [character.name])
       }
       charactersSeen.add(characterId)
     })
@@ -49,7 +172,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
       if (!prop) return
       const introducedAt = sceneIndex(prop.introducedSceneId)
       if (!propsSeen.has(propId) && introducedAt > index) {
-        warnings.push({
+        stamp({
           id: `prop-${scene.id}-${propId}`,
           type: 'prop',
           severity: 'error',
@@ -57,7 +180,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
           title: `${prop.name}尚未提前建立`,
           detail: `道具在场景 ${scene.number} 已出现，但首次建立被标记在场景 ${script.scenes[introducedAt]?.number ?? '未知'}。`,
           suggestion: '调整首次建立场景，或在当前场景加入来源、交接动作与持有人反应。'
-        })
+        }, scene, [prop.name])
       }
       propsSeen.add(propId)
     })
@@ -67,7 +190,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
       const character = script.characters.find((item) => item.id === characterId)
       if (!wardrobe || !character) return
       if (!wardrobe.timePeriods.includes(scene.dayNight)) {
-        warnings.push({
+        stamp({
           id: `wardrobe-${scene.id}-${characterId}-${wardrobeId}`,
           type: 'wardrobe',
           severity: 'warning',
@@ -75,7 +198,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
           title: `${character.name}服装与时间冲突`,
           detail: `“${wardrobe.name}”只配置用于 ${wardrobe.timePeriods.join('、')}，本场标记为“${scene.dayNight}”。`,
           suggestion: '确认是否跨越时间连续拍摄；如需延续服装，请把当前时段加入服装适用范围。'
-        })
+        }, scene, [character.name, wardrobe.name])
       }
     })
 
@@ -84,7 +207,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
       const previousDay = previous.storyTime.match(/第\s*(\d+)\s*天/)?.[1]
       const currentDay = scene.storyTime.match(/第\s*(\d+)\s*天/)?.[1]
       if (previousDay && currentDay && Number(currentDay) < Number(previousDay)) {
-        warnings.push({
+        stamp({
           id: `timeline-${scene.id}`,
           type: 'timeline',
           severity: 'error',
@@ -92,7 +215,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
           title: '时间线出现倒退',
           detail: `上一场为第 ${previousDay} 天，本场却标记为第 ${currentDay} 天，可能造成观看顺序混乱。`,
           suggestion: '调整故事时间，或明确使用倒叙并在场次摘要中标注时间跳转。'
-        })
+        }, scene, [])
       }
     }
   })
@@ -159,7 +282,8 @@ export function useContinuityStore() {
       undoRef.current.push(clone(previous.script))
       if (undoRef.current.length > 80) undoRef.current.shift()
       redoRef.current = []
-      return { ...previous, script: next, updatedAt: new Date().toISOString() }
+      const now = new Date().toISOString()
+      return { ...previous, script: next, reviews: reconcileReviews(previous.reviews, deriveWarnings(next), now), updatedAt: now }
     })
   }, [])
 
@@ -168,7 +292,8 @@ export function useContinuityStore() {
       const target = undoRef.current.pop()
       if (!target) return previous
       redoRef.current.push(clone(previous.script))
-      return { ...previous, script: target, updatedAt: new Date().toISOString() }
+      const now = new Date().toISOString()
+      return { ...previous, script: target, reviews: reconcileReviews(previous.reviews, deriveWarnings(target), now), updatedAt: now }
     })
   }, [])
 
@@ -177,7 +302,8 @@ export function useContinuityStore() {
       const target = redoRef.current.pop()
       if (!target) return previous
       undoRef.current.push(clone(previous.script))
-      return { ...previous, script: target, updatedAt: new Date().toISOString() }
+      const now = new Date().toISOString()
+      return { ...previous, script: target, reviews: reconcileReviews(previous.reviews, deriveWarnings(target), now), updatedAt: now }
     })
   }, [])
 
@@ -280,30 +406,37 @@ export function useContinuityStore() {
   }, [mutate])
 
   const setReviewStatus = useCallback((warningId: string, status: WarningReview['status']) => {
-    setState((previous) => ({
-      ...previous,
-      reviews: {
-        ...previous.reviews,
-        [warningId]: { ...(previous.reviews[warningId] ?? { replies: [] }), status }
-      },
-      updatedAt: new Date().toISOString()
-    }))
+    setState((previous) => {
+      const now = new Date().toISOString()
+      const warning = deriveWarnings(previous.script).find((item) => item.id === warningId)
+      const base = previous.reviews[warningId] ? normalizeReview(previous.reviews[warningId]) : createEmptyReview()
+      const next: WarningReview = {
+        ...base,
+        status,
+        decidedAt: now,
+        fingerprint: warning ? warning.fingerprint : base.fingerprint,
+        snapshot: warning ? snapshotOf(warning) : base.snapshot,
+        missingSince: warning ? null : base.missingSince
+      }
+      return { ...previous, reviews: { ...previous.reviews, [warningId]: next }, updatedAt: now }
+    })
   }, [])
 
   const addReply = useCallback((warningId: string, author: string, text: string) => {
     if (!text.trim()) return
     const reply: Reply = { id: id('reply'), author, text: text.trim(), createdAt: new Date().toISOString() }
-    setState((previous) => ({
-      ...previous,
-      reviews: {
-        ...previous.reviews,
-        [warningId]: {
-          status: previous.reviews[warningId]?.status ?? 'pending',
-          replies: [...(previous.reviews[warningId]?.replies ?? []), reply]
-        }
-      },
-      updatedAt: new Date().toISOString()
-    }))
+    setState((previous) => {
+      const warning = deriveWarnings(previous.script).find((item) => item.id === warningId)
+      const base = previous.reviews[warningId] ? normalizeReview(previous.reviews[warningId]) : createEmptyReview()
+      const next: WarningReview = {
+        ...base,
+        replies: [...base.replies, reply],
+        fingerprint: warning ? warning.fingerprint : base.fingerprint,
+        snapshot: warning ? snapshotOf(warning) : base.snapshot,
+        missingSince: warning ? null : base.missingSince
+      }
+      return { ...previous, reviews: { ...previous.reviews, [warningId]: next }, updatedAt: new Date().toISOString() }
+    })
   }, [])
 
   const createVersion = useCallback((name: string) => {
