@@ -1,6 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sampleScript } from './sample'
-import type { Character, ContinuityState, DiffItem, Prop, Reply, Scene, Script, Version, Wardrobe, WarningItem, WarningReview } from './types'
+import type {
+  Character,
+  ContinuityState,
+  DiffItem,
+  Prop,
+  Reply,
+  ReviewArchiveEntry,
+  Scene,
+  Script,
+  Version,
+  Wardrobe,
+  WarningFingerprint,
+  WarningItem,
+  WarningReview,
+  WarningType
+} from './types'
 
 const STORAGE_KEY = 'sologsb-1017-continuity-v1'
 const clone = <T,>(value: T): T => structuredClone(value)
@@ -11,7 +26,10 @@ function initialState(): ContinuityState {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (raw) {
       const parsed = JSON.parse(raw) as ContinuityState
-      if (parsed.script?.scenes?.length) return parsed
+      if (parsed.script?.scenes?.length) {
+        // 升级前留下的决定可能没有内容快照，载入时先按当前警告对一次账。
+        return reconcileReviews(parsed)
+      }
     }
   } catch {
     // Ignore an invalid local draft and restore the bundled example.
@@ -36,6 +54,8 @@ export function deriveWarnings(script: Script): WarningItem[] {
           type: 'character',
           severity: index > 1 ? 'error' : 'warning',
           sceneId: scene.id,
+          subjectId: characterId,
+          subjectLabel: `角色「${character.name}」`,
           title: `${character.name}突然出现`,
           detail: `角色在场景 ${scene.number} 首次出现，但前序场景没有建立其身份、关系或到场铺垫。`,
           suggestion: `在更早场景补充提及、声音或到场动作，并把“首次建立”场景改为相应场次。`
@@ -54,6 +74,8 @@ export function deriveWarnings(script: Script): WarningItem[] {
           type: 'prop',
           severity: 'error',
           sceneId: scene.id,
+          subjectId: propId,
+          subjectLabel: `道具「${prop.name}」`,
           title: `${prop.name}尚未提前建立`,
           detail: `道具在场景 ${scene.number} 已出现，但首次建立被标记在场景 ${script.scenes[introducedAt]?.number ?? '未知'}。`,
           suggestion: '调整首次建立场景，或在当前场景加入来源、交接动作与持有人反应。'
@@ -72,6 +94,8 @@ export function deriveWarnings(script: Script): WarningItem[] {
           type: 'wardrobe',
           severity: 'warning',
           sceneId: scene.id,
+          subjectId: wardrobeId,
+          subjectLabel: `角色「${character.name}」的服装「${wardrobe.name}」`,
           title: `${character.name}服装与时间冲突`,
           detail: `“${wardrobe.name}”只配置用于 ${wardrobe.timePeriods.join('、')}，本场标记为“${scene.dayNight}”。`,
           suggestion: '确认是否跨越时间连续拍摄；如需延续服装，请把当前时段加入服装适用范围。'
@@ -89,6 +113,8 @@ export function deriveWarnings(script: Script): WarningItem[] {
           type: 'timeline',
           severity: 'error',
           sceneId: scene.id,
+          subjectId: 'story-time',
+          subjectLabel: '故事时间线',
           title: '时间线出现倒退',
           detail: `上一场为第 ${previousDay} 天，本场却标记为第 ${currentDay} 天，可能造成观看顺序混乱。`,
           suggestion: '调整故事时间，或明确使用倒叙并在场次摘要中标注时间跳转。'
@@ -97,6 +123,227 @@ export function deriveWarnings(script: Script): WarningItem[] {
     }
   })
   return warnings
+}
+
+/** 提取一条警告当前的全部内容，作为决定与回复的归属依据。 */
+export function fingerprintWarning(warning: WarningItem, script: Script): WarningFingerprint {
+  const scene = script.scenes.find((item) => item.id === warning.sceneId)
+  return {
+    type: warning.type,
+    sceneId: warning.sceneId,
+    sceneNumber: scene?.number ?? '',
+    subjectId: warning.subjectId,
+    subjectLabel: warning.subjectLabel,
+    title: warning.title,
+    detail: warning.detail
+  }
+}
+
+const typeLabel: Record<WarningType, string> = {
+  character: '人物',
+  prop: '道具',
+  wardrobe: '服装',
+  timeline: '时间线'
+}
+
+/** 解析旧式决定键（类型-场景ID-…），用于升级前决定的认领与跨槽转移。 */
+function parseWarningKey(key: string, script: Script): { type: WarningType; sceneId: string; subjectId: string } | null {
+  const prefixes: Array<[WarningType, string]> = [
+    ['wardrobe', 'wardrobe-'],
+    ['character', 'character-'],
+    ['prop', 'prop-'],
+    ['timeline', 'timeline-']
+  ]
+  for (const [type, prefix] of prefixes) {
+    if (!key.startsWith(prefix)) continue
+    const rest = key.slice(prefix.length)
+    const scene = script.scenes.find((item) => rest === item.id || rest.startsWith(`${item.id}-`))
+    if (!scene) return null
+    let subjectId = rest.slice(scene.id.length)
+    if (subjectId.startsWith('-')) subjectId = subjectId.slice(1)
+    if (type === 'timeline') subjectId = 'story-time'
+    return { type, sceneId: scene.id, subjectId }
+  }
+  return null
+}
+
+function describeFingerprintDiff(before: WarningFingerprint, after: WarningFingerprint): string {
+  const changes: string[] = []
+  if (before.sceneId !== after.sceneId) changes.push('警告转移到了别的场次')
+  if (before.sceneNumber !== after.sceneNumber) changes.push(`场景号由「${before.sceneNumber || '空'}」变为「${after.sceneNumber || '空'}」`)
+  if (before.subjectId !== after.subjectId || before.subjectLabel !== after.subjectLabel) {
+    changes.push(`涉及对象由${before.subjectLabel || typeLabel[before.type]}变为${after.subjectLabel || typeLabel[after.type]}`)
+  }
+  if (before.title !== after.title) changes.push(`问题标题由「${before.title}」变为「${after.title}」`)
+  if (before.detail !== after.detail) changes.push('说明文字已改动')
+  return changes.length ? changes.join('；') : '警告内容有改动'
+}
+
+function formatGap(start: string, end: string): string {
+  const ms = Date.parse(end) - Date.parse(start)
+  if (!Number.isFinite(ms) || ms < 60_000) return '一小段时间'
+  const minutes = Math.round(ms / 60_000)
+  if (minutes < 60) return `${minutes} 分钟`
+  const hours = Math.round(minutes / 60)
+  if (hours < 24) return `${hours} 小时`
+  const days = Math.round(hours / 24)
+  return `${days} 天`
+}
+
+function hasMeaningfulReview(review: WarningReview | undefined): boolean {
+  return !!review && (review.status !== 'pending' || review.replies.length > 0)
+}
+
+function archiveReview(review: WarningReview, reason: string, now: string): WarningReview {
+  const entry: ReviewArchiveEntry = {
+    status: review.status,
+    decidedAt: review.decidedAt,
+    replies: clone(review.replies),
+    fingerprint: clone(review.fingerprint ?? null),
+    migrated: review.migrated,
+    invalidatedAt: now,
+    invalidReason: reason
+  }
+  return {
+    status: 'pending',
+    replies: [],
+    fingerprint: null,
+    migrated: false,
+    archive: [...(review.archive ?? []), entry]
+  }
+}
+
+/**
+ * 让每条决定/回复跟随当时那条警告：
+ * - 警告消失后再出现：旧决定作废，回到待审；
+ * - 场号、涉及角色/道具、说明文字等内容不同：旧决定作废，回到待审；
+ * - 升级前无快照的决定：按警告编号（必要时按类型+场次+涉及对象）认领，认不出来的留待重新出现时回待审；
+ * - 恢复旧版本后同样重新对账。
+ */
+export function reconcileReviews(state: ContinuityState): ContinuityState {
+  const { script } = state
+  const warnings = deriveWarnings(script)
+  const reviews = clone(state.reviews ?? {})
+  const warningById = new Map(warnings.map((warning) => [warning.id, warning]))
+  let changed = false
+  const now = new Date().toISOString()
+
+  const invalidate = (key: string, reason: string) => {
+    const current = reviews[key]
+    if (current) {
+      reviews[key] = archiveReview(current, reason, now)
+      changed = true
+    }
+  }
+
+  // 第一阶段：决定键对应的警告槽位已经不在（场次或涉及对象被换掉）。
+  // 升级前的旧决定没有内容快照，尽量按“类型+场次+涉及对象”找到同槽位的新警告认领。
+  const claimedTargets = new Set<string>()
+  for (const [key, review] of Object.entries(reviews)) {
+    if (warningById.has(key)) continue
+    // 没有任何人工记录的空槽位不需要认领，留给第三阶段清理。
+    if (!hasMeaningfulReview(review)) continue
+    const parsed = parseWarningKey(key, script)
+    if (!parsed) {
+      if (!review.disappearedAt) {
+        review.disappearedAt = now
+        changed = true
+      }
+      continue
+    }
+    const candidate = warnings.find(
+      (warning) =>
+        warning.type === parsed.type &&
+        warning.sceneId === parsed.sceneId &&
+        !claimedTargets.has(warning.id) &&
+        (parsed.type === 'timeline' || warning.subjectId === parsed.subjectId)
+    )
+    if (!candidate) {
+      if (!review.disappearedAt) {
+        review.disappearedAt = now
+        changed = true
+      }
+      continue
+    }
+    claimedTargets.add(candidate.id)
+    if (!review.fingerprint) {
+      // 升级前的决定按当前槽位认领，但因为没有当时的内容快照，一律视为新警告重新审阅。
+      const moved: WarningReview = archiveReview(
+        review,
+        `升级前留下的决定在当前剧本中找到了同类型、同场次、同涉及对象的警告（${typeLabel[candidate.type]}·场景 ${script.scenes.find((scene) => scene.id === candidate.sceneId)?.number ?? '-'}），但缺少当时的警告内容记录，无法确认内容一致，需要重新审阅。`,
+        now
+      )
+      reviews[candidate.id] = { ...moved, disappearedAt: undefined }
+    } else if (warningById.has(candidate.id) && !reviews[candidate.id]) {
+      const current = fingerprintWarning(candidate, script)
+      reviews[candidate.id] = { ...archiveReview(review, describeFingerprintDiff(review.fingerprint, current), now), disappearedAt: undefined }
+    } else {
+      if (!review.disappearedAt) {
+        review.disappearedAt = now
+        changed = true
+      }
+      continue
+    }
+    delete reviews[key]
+    changed = true
+  }
+
+  // 第二阶段：当前存在的警告，逐一与决定所绑定的历史内容对账。
+  for (const warning of warnings) {
+    const review = reviews[warning.id]
+    const fingerprint = fingerprintWarning(warning, script)
+    if (!review) continue
+    if (review.disappearedAt) {
+      invalidate(
+        warning.id,
+        `该警告曾在 ${new Date(review.disappearedAt).toLocaleString('zh-CN')} 随作者修改消失，约 ${formatGap(review.disappearedAt, now)}后同样的问题再次出现，上次的${review.status === 'accepted' ? '接受' : '忽略'}决定不再算数。`
+      )
+      if (reviews[warning.id]?.disappearedAt) reviews[warning.id] = { ...reviews[warning.id], disappearedAt: undefined }
+      continue
+    }
+    if (!review.fingerprint) {
+      if (hasMeaningfulReview(review)) {
+        // 升级前的决定按警告编号认领：内容快照缺失，标注“升级前认领”，审阅人可据此重新判断。
+        if (!review.migrated) {
+          review.migrated = true
+          changed = true
+        }
+        review.fingerprint = fingerprint
+        changed = true
+      }
+      continue
+    }
+    const previous = review.fingerprint
+    const same =
+      previous.type === fingerprint.type &&
+      previous.sceneId === fingerprint.sceneId &&
+      previous.sceneNumber === fingerprint.sceneNumber &&
+      previous.subjectId === fingerprint.subjectId &&
+      previous.subjectLabel === fingerprint.subjectLabel &&
+      previous.title === fingerprint.title &&
+      previous.detail === fingerprint.detail
+    if (!same) {
+      invalidate(warning.id, describeFingerprintDiff(previous, fingerprint))
+    }
+  }
+
+  // 第三阶段：仍然对不上任何当前警告的决定，记录消失时间；重新出现时由第二阶段作废。
+  for (const [key, review] of Object.entries(reviews)) {
+    if (warningById.has(key)) continue
+    if (!hasMeaningfulReview(review) && !review.archive?.length) {
+      if (review.disappearedAt) {
+        delete review.disappearedAt
+        changed = true
+      }
+      continue
+    }
+    if (!review.disappearedAt) {
+      review.disappearedAt = now
+      changed = true
+    }
+  }
+
+  return changed ? { ...state, reviews } : state
 }
 
 export function diffScript(base: Script, current: Script): DiffItem[] {
@@ -159,7 +406,8 @@ export function useContinuityStore() {
       undoRef.current.push(clone(previous.script))
       if (undoRef.current.length > 80) undoRef.current.shift()
       redoRef.current = []
-      return { ...previous, script: next, updatedAt: new Date().toISOString() }
+      // 剧本一改，旧决定是否还对得上当前警告要立刻重新对账，避免卡片沿用历史忽略。
+      return reconcileReviews({ ...previous, script: next, updatedAt: new Date().toISOString() })
     })
   }, [])
 
@@ -168,7 +416,7 @@ export function useContinuityStore() {
       const target = undoRef.current.pop()
       if (!target) return previous
       redoRef.current.push(clone(previous.script))
-      return { ...previous, script: target, updatedAt: new Date().toISOString() }
+      return reconcileReviews({ ...previous, script: target, updatedAt: new Date().toISOString() })
     })
   }, [])
 
@@ -177,7 +425,7 @@ export function useContinuityStore() {
       const target = redoRef.current.pop()
       if (!target) return previous
       undoRef.current.push(clone(previous.script))
-      return { ...previous, script: target, updatedAt: new Date().toISOString() }
+      return reconcileReviews({ ...previous, script: target, updatedAt: new Date().toISOString() })
     })
   }, [])
 
@@ -280,30 +528,46 @@ export function useContinuityStore() {
   }, [mutate])
 
   const setReviewStatus = useCallback((warningId: string, status: WarningReview['status']) => {
-    setState((previous) => ({
-      ...previous,
-      reviews: {
-        ...previous.reviews,
-        [warningId]: { ...(previous.reviews[warningId] ?? { replies: [] }), status }
-      },
-      updatedAt: new Date().toISOString()
-    }))
+    setState((previous) => {
+      const existing = previous.reviews[warningId]
+      // 已失效归档后重新做出的决定，必须绑定到当前这条警告的内容。
+      const warning = deriveWarnings(previous.script).find((item) => item.id === warningId)
+      const fingerprint = warning ? fingerprintWarning(warning, previous.script) : existing?.fingerprint ?? null
+      const next: WarningReview = {
+        ...(existing ?? { replies: [] }),
+        status,
+        fingerprint,
+        migrated: false,
+        decidedAt: status === 'pending' ? undefined : new Date().toISOString(),
+        archive: existing?.archive ?? []
+      }
+      if (status === 'pending' && !next.replies.length && !next.archive?.length) {
+        const reviews = { ...previous.reviews }
+        delete reviews[warningId]
+        return { ...previous, reviews, updatedAt: new Date().toISOString() }
+      }
+      return { ...previous, reviews: { ...previous.reviews, [warningId]: next }, updatedAt: new Date().toISOString() }
+    })
   }, [])
 
   const addReply = useCallback((warningId: string, author: string, text: string) => {
     if (!text.trim()) return
     const reply: Reply = { id: id('reply'), author, text: text.trim(), createdAt: new Date().toISOString() }
-    setState((previous) => ({
-      ...previous,
-      reviews: {
-        ...previous.reviews,
-        [warningId]: {
-          status: previous.reviews[warningId]?.status ?? 'pending',
-          replies: [...(previous.reviews[warningId]?.replies ?? []), reply]
-        }
-      },
-      updatedAt: new Date().toISOString()
-    }))
+    setState((previous) => {
+      const existing = previous.reviews[warningId]
+      // 回复同样跟随当时的警告内容：首次回复时若尚未绑定，则锁定当前内容快照。
+      const warning = deriveWarnings(previous.script).find((item) => item.id === warningId)
+      const fingerprint = existing?.fingerprint ?? (warning ? fingerprintWarning(warning, previous.script) : null)
+      const review: WarningReview = {
+        status: existing?.status ?? 'pending',
+        replies: [...(existing?.replies ?? []), reply],
+        fingerprint,
+        decidedAt: existing?.decidedAt,
+        migrated: existing?.migrated,
+        archive: existing?.archive ?? []
+      }
+      return { ...previous, reviews: { ...previous.reviews, [warningId]: review }, updatedAt: new Date().toISOString() }
+    })
   }, [])
 
   const createVersion = useCallback((name: string) => {

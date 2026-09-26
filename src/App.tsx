@@ -35,6 +35,7 @@ import {
   Close,
   Storage,
   Difference,
+  History,
   Keyboard,
   NavigateBefore,
   NavigateNext,
@@ -345,6 +346,7 @@ export default function App() {
           {visibleWarnings.map((warning) => {
             const review = state.reviews[warning.id] ?? { status: 'pending' as WarningStatus, replies: [] }
             const scene = state.script.scenes.find((item) => item.id === warning.sceneId)
+            const latestArchive = review.archive?.[review.archive.length - 1]
             return (
               <Paper
                 key={warning.id}
@@ -359,6 +361,7 @@ export default function App() {
                     <Stack direction="row" gap={1} alignItems="center" flexWrap="wrap">
                       <Typography variant="h6">{warning.title}</Typography>
                       <Chip size="small" label={`场景 ${scene?.number ?? '-'}`} onClick={() => openScene(warning.sceneId)} />
+                      <Chip size="small" variant="outlined" label={warning.subjectLabel} />
                       <Chip size="small" variant="outlined" label={warning.type === 'character' ? '人物' : warning.type === 'prop' ? '道具' : warning.type === 'wardrobe' ? '服装' : '时间线'} />
                     </Stack>
                     <Typography mt={1}>{warning.detail}</Typography>
@@ -366,6 +369,46 @@ export default function App() {
                   </Box>
                   <Chip label={review.status === 'accepted' ? '已接受' : review.status === 'ignored' ? '已忽略' : '待审'} color={review.status === 'accepted' ? 'success' : review.status === 'ignored' ? 'default' : 'warning'} />
                 </Box>
+                {latestArchive && (
+                  <Alert severity={review.status === 'pending' ? 'warning' : 'info'} className="decision-history-banner" icon={<History />}>
+                    <Typography variant="body2" fontWeight={700}>
+                      上一次决定（{latestArchive.status === 'accepted' ? '已接受' : latestArchive.status === 'ignored' ? '已忽略' : '待审'}）已于 {new Date(latestArchive.invalidatedAt).toLocaleString('zh-CN')} 失效
+                    </Typography>
+                    <Typography variant="body2">{latestArchive.invalidReason}</Typography>
+                    {(latestArchive.decidedAt || latestArchive.replies.length > 0) && (
+                      <Box className="decision-history-meta">
+                        {latestArchive.decidedAt && <Typography variant="caption">决定时间：{new Date(latestArchive.decidedAt).toLocaleString('zh-CN')}</Typography>}
+                        {latestArchive.migrated && <Typography variant="caption">该决定来自本次升级前，按当时警告编号认领。</Typography>}
+                        {latestArchive.fingerprint && (
+                          <Typography variant="caption">
+                            当时内容：场景 {latestArchive.fingerprint.sceneNumber || '-'} · {latestArchive.fingerprint.subjectLabel} · {latestArchive.fingerprint.title}
+                          </Typography>
+                        )}
+                      </Box>
+                    )}
+                    {latestArchive.replies.length > 0 && (
+                      <Box className="reply-list history-reply-list">
+                        {latestArchive.replies.map((reply) => (
+                          <Box key={reply.id} className="reply-item">
+                            <strong>{reply.author}</strong>
+                            <span>{reply.text}</span>
+                            <small>{new Date(reply.createdAt).toLocaleString('zh-CN')}</small>
+                          </Box>
+                        ))}
+                      </Box>
+                    )}
+                  </Alert>
+                )}
+                {!latestArchive && review.migrated && (
+                  <Typography className="migrated-note" variant="caption">
+                    升级前留下的决定，已按警告编号（场景 {scene?.number ?? '-'} · {warning.subjectLabel}）认领；若内容对不上，请重新审阅。
+                  </Typography>
+                )}
+                {!latestArchive && !review.migrated && review.decidedAt && review.status !== 'pending' && (
+                  <Typography className="decided-at-note" variant="caption">
+                    当前{review.status === 'accepted' ? '接受' : '忽略'}决定时间：{new Date(review.decidedAt).toLocaleString('zh-CN')}
+                  </Typography>
+                )}
                 <Stack direction="row" gap={1} mt={1.5} flexWrap="wrap">
                   <Button size="small" variant={review.status === 'accepted' ? 'contained' : 'outlined'} startIcon={<CheckCircle />} onClick={() => store.setReviewStatus(warning.id, 'accepted')}>接受问题</Button>
                   <Button size="small" variant={review.status === 'ignored' ? 'contained' : 'outlined'} color="inherit" startIcon={<Block />} onClick={() => store.setReviewStatus(warning.id, 'ignored')}>忽略警告</Button>

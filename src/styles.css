@@ -70,6 +70,12 @@ mark { padding: 0 .1em; color: #3a2414; background: #f1d486; border-radius: 2px;
 .reply-item { display: grid; grid-template-columns: 72px 1fr auto; gap: 10px; align-items: baseline; font-size: 13px; }
 .reply-item strong { color: #765033; }
 .reply-item small { color: #958b80; }
+.decision-history-banner { margin-top: 14px; align-items: flex-start; }
+.decision-history-banner .MuiAlert-message { width: 100%; }
+.decision-history-meta { display: grid; gap: 2px; margin-top: 4px; color: #8b8277; }
+.history-reply-list { margin-top: 8px; background: rgba(255, 255, 255, .62); }
+.migrated-note, .decided-at-note { display: block; margin-top: 10px; padding: 6px 10px; border-left: 3px solid #c9a875; border-radius: 0 6px 6px 0; background: #f6efe2; color: #7d6444; }
+.decided-at-note { border-left-color: #8aa08e; background: #f2f6f0; color: #55705c; }
 .version-layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 16px; }
 .version-list, .diff-panel { padding: 18px; border: 1px solid #d8d0c4 !important; border-radius: 13px !important; }
 .version-list .MuiListItemButton-root { margin-top: 4px; border-radius: 8px; }
